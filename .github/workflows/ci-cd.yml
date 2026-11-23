@@ -1,0 +1,105 @@
+name: CI/CD
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*.*.*"]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/release-info-api
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+      - run: pip install -r requirements-dev.txt
+      - name: Lint
+        run: flake8 src tests --max-line-length 120
+      - name: Unit tests with coverage
+        run: python -m pytest -q --cov=src --cov-report=term-missing --cov-fail-under=80
+
+  build-image:
+    needs: lint-and-test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: meta
+        name: Compute image tag
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then TAG="${GITHUB_REF_NAME#v}"; else TAG="sha-${GITHUB_SHA::7}"; fi
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+      - name: Build image
+        run: |
+          docker build \
+            --build-arg APP_VERSION=${{ steps.meta.outputs.tag }} \
+            --build-arg GIT_SHA=${GITHUB_SHA::7} \
+            -t "$IMAGE:${{ steps.meta.outputs.tag }}" .
+      - name: Container smoke test
+        run: |
+          docker run -d --name smoke -p 8000:8000 -e APP_ENV=ci "$IMAGE:${{ steps.meta.outputs.tag }}"
+          for i in $(seq 1 15); do curl -fsS localhost:8000/health && break; sleep 2; done
+          curl -fsS localhost:8000/version | tee /dev/stderr | grep -q '"environment":"ci"'
+      - name: Push to GitHub Container Registry
+        if: github.event_name != 'pull_request'
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          docker tag "$IMAGE:${{ steps.meta.outputs.tag }}" "$IMAGE:latest"
+          docker push "$IMAGE:${{ steps.meta.outputs.tag }}"
+          docker push "$IMAGE:latest"
+
+  deploy-staging:
+    needs: build-image
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: staging
+    steps:
+      - uses: actions/checkout@v4
+      - name: Deploy over SSH
+        env:
+          SSH_HOST: ${{ secrets.STAGING_HOST }}
+          SSH_USER: ${{ secrets.STAGING_USER }}
+          SSH_KEY: ${{ secrets.STAGING_SSH_KEY }}
+        run: |
+          if [[ -z "$SSH_HOST" ]]; then
+            echo "::notice::STAGING_HOST secret not set - skipping remote deploy (portfolio demo)."
+            exit 0
+          fi
+          install -m 600 /dev/null key && echo "$SSH_KEY" > key
+          scp -i key -o StrictHostKeyChecking=accept-new deploy/deploy.sh config/staging.env "$SSH_USER@$SSH_HOST:/opt/release-info/"
+          ssh -i key "$SSH_USER@$SSH_HOST" "bash /opt/release-info/deploy.sh $IMAGE:${{ needs.build-image.outputs.tag }} staging"
+
+  deploy-production:
+    needs: [build-image, deploy-staging]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    environment: production   # add required reviewers in repo settings for a manual gate
+    steps:
+      - uses: actions/checkout@v4
+      - name: Deploy over SSH
+        env:
+          SSH_HOST: ${{ secrets.PROD_HOST }}
+          SSH_USER: ${{ secrets.PROD_USER }}
+          SSH_KEY: ${{ secrets.PROD_SSH_KEY }}
+        run: |
+          if [[ -z "$SSH_HOST" ]]; then
+            echo "::notice::PROD_HOST secret not set - skipping remote deploy (portfolio demo)."
+            exit 0
+          fi
+          install -m 600 /dev/null key && echo "$SSH_KEY" > key
+          scp -i key -o StrictHostKeyChecking=accept-new deploy/deploy.sh config/production.env "$SSH_USER@$SSH_HOST:/opt/release-info/"
+          ssh -i key "$SSH_USER@$SSH_HOST" "bash /opt/release-info/deploy.sh $IMAGE:${{ needs.build-image.outputs.tag }} production"
